@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Cybrium AI <hello@cybrium.ai>"]
 description = "Lightweight endpoint security agent — process, network, software inventory for IT/OT environments"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/cybrium-ai/cyguard"
 
 [[bin]]
