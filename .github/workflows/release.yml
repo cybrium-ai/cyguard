@@ -1,24 +1,32 @@
 name: Release
+
 on:
   push:
     tags: ['v*']
+
 permissions:
   contents: write
-  packages: write
-  id-token: write    # OIDC for Azure Trusted Signing
+  packages: write    # GHCR push for the cyguard container image
+  id-token: write    # OIDC federated token for Azure Trusted Signing (Windows)
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: cybrium-ai-linux
             name: cyguard-linux-amd64
+            sign: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             name: cyguard-linux-arm64
+            sign: false
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
             name: cyguard-darwin-amd64
             sign: true
           - target: aarch64-apple-darwin
@@ -28,6 +36,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: cyguard-windows-amd64.exe
+            sign: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -35,55 +44,60 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+
       - run: cargo build --release --target ${{ matrix.target }}
-      - name: Sign macOS binary
+
+      # ── Apple code signing (macOS builds only) ─────────────────────
+      - name: Import Apple signing certificate
         if: matrix.sign
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          if [ -n "$APPLE_CERTIFICATE_BASE64" ]; then
-            CERT_PATH=$RUNNER_TEMP/cert.p12
-            KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
-            KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
-            echo -n "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o $CERT_PATH
-            security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-            security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-            security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-            security import $CERT_PATH -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
-            security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-            security list-keychain -d user -s $KEYCHAIN_PATH
-            codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --options runtime target/${{ matrix.target }}/release/cyguard
-          fi
-      - name: Notarize
+          CERT_PATH=$RUNNER_TEMP/cert.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+
+          echo -n "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o $CERT_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $CERT_PATH -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+      - name: Sign macOS binary
         if: matrix.sign
         env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          if [ -n "$APPLE_ID" ]; then
-            ditto -c -k --keepParent target/${{ matrix.target }}/release/cyguard /tmp/cyguard.zip
-            xcrun notarytool submit /tmp/cyguard.zip --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait || true
-          fi
-      - name: Package (Unix)
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --options runtime target/${{ matrix.target }}/release/cyguard
+          codesign --verify --deep --strict target/${{ matrix.target }}/release/cyguard
+          echo "Signed and verified: ${{ matrix.name }}"
+
+      - name: Package binary (Unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/cyguard dist/${{ matrix.name }}
           chmod +x dist/${{ matrix.name }}
-      - name: Package (Windows)
+
+      - name: Package binary (Windows)
         if: runner.os == 'Windows'
         run: |
           mkdir dist
           cp target/${{ matrix.target }}/release/cyguard.exe dist/${{ matrix.name }}
 
+      # ── Azure Trusted Signing (Windows binaries only) ──────────────
+      # Federated OIDC — no client_secret. Subject filter on the FIC
+      # is ref:refs/tags/v* so PR jobs literally cannot mint a token.
+      # azure/login MUST run before trusted-signing-action so the
+      # DefaultAzureCredential chain finds an OIDC token to use.
       - name: Azure login (federated OIDC)
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
         uses: azure/login@v2
-
-      - uses: actions/upload-artifact@v4
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -112,6 +126,26 @@ jobs:
           Write-Host "Signature status: $($sig.Status)"
           Write-Host "Signer: $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { throw "Signature verification failed: $($sig.Status)" }
+
+      - name: Notarize macOS binary
+        if: matrix.sign
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent dist/${{ matrix.name }} /tmp/${{ matrix.name }}.zip
+          xcrun notarytool submit /tmp/${{ matrix.name }}.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          echo "Notarization complete for ${{ matrix.name }}"
+
+      # Windows artifact is already signed in place by the previous
+      # step on tag pushes (no-op on PRs). All platforms upload under
+      # the canonical matrix.name so downstream jobs are uniform.
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: dist/${{ matrix.name }}
@@ -124,9 +158,17 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Checksums
-        run: cd artifacts && for dir in */; do (cd "$dir" && sha256sum * >> ../checksums.txt); done
-      - uses: softprops/action-gh-release@v2
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          for dir in */; do
+            (cd "$dir" && sha256sum * >> ../checksums.txt)
+          done
+          cat checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
@@ -136,3 +178,145 @@ jobs:
             artifacts/cyguard-darwin-arm64/cyguard-darwin-arm64
             artifacts/cyguard-windows-amd64.exe/cyguard-windows-amd64.exe
             artifacts/checksums.txt
+
+      # ── Auto-publish Homebrew formula to cybrium-ai/homebrew-cli ──
+      - name: Resolve version
+        id: ver
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract per-platform SHA256s
+        id: sums
+        run: |
+          {
+            echo "darwin_arm64_sha=$(awk '/cyguard-darwin-arm64$/  {print $1}' artifacts/checksums.txt)"
+            echo "darwin_amd64_sha=$(awk '/cyguard-darwin-amd64$/  {print $1}' artifacts/checksums.txt)"
+            echo "linux_arm64_sha=$(awk  '/cyguard-linux-arm64$/   {print $1}' artifacts/checksums.txt)"
+            echo "linux_amd64_sha=$(awk  '/cyguard-linux-amd64$/   {print $1}' artifacts/checksums.txt)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: cybrium-ai/homebrew-cli
+          token:      ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path:       homebrew-cli
+
+      # ── GHCR multi-arch image ──────────────────────────────────────
+      # Uses the prebuilt linux binaries from the matrix `build` job so we
+      # don't recompile inside Docker. The runtime image is debian-slim
+      # plus ca-certificates + tini; payloads/rules are baked in at
+      # /opt/cyguard so the SentinelAI cyguard_runner can invoke
+      #   cyguard scan ... --payloads /opt/cyguard/payloads
+      # without bind-mounting anything from the host or the K8s pod.
+      - name: Stage linux binaries for docker build
+        run: |
+          install -m 0755 artifacts/cyguard-linux-amd64/cyguard-linux-amd64 ./cyguard-linux-amd64
+          install -m 0755 artifacts/cyguard-linux-arm64/cyguard-linux-arm64 ./cyguard-linux-arm64
+
+      # Sprint v0.8.1 — convert the upstream community template repo
+      # into cyguard's format and bundle the converted set into the image.
+      # Runs on every `v*` tag so a fresh release always carries fresh
+      # templates. Conversion failures are tolerated (the converter
+      # skips templates whose DSL features aren't supported yet) — we
+      # publish whatever converts cleanly. The image build's COPY
+      # directive expects `templates-converted/` to exist even when
+      # empty.
+      - name: Convert upstream templates → cyguard format
+        run: |
+          mkdir -p templates-converted
+          # Best-effort clone — if the upstream repo is unreachable we
+          # ship the image without templates rather than fail the build.
+          if git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates /tmp/upstream-templates; then
+            install -m 0755 artifacts/cyguard-linux-amd64/cyguard-linux-amd64 /tmp/cyguard-converter
+            /tmp/cyguard-converter convert-templates \
+              --input /tmp/upstream-templates \
+              --output templates-converted/ \
+              || echo "convert-templates exited non-zero — using whatever converted cleanly"
+            CONVERTED=$(find templates-converted -name '*.yaml' | wc -l | tr -d ' ')
+            echo "Converted $CONVERTED templates from upstream community repo."
+          else
+            echo "Could not reach upstream templates — shipping image without bundled templates."
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push cyguard image (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file:    Dockerfile
+          push:    true
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          tags: |
+            ghcr.io/cybrium-ai/cyguard:${{ steps.ver.outputs.tag }}
+            ghcr.io/cybrium-ai/cyguard:latest
+          cache-from: type=gha,scope=cyguard
+          cache-to:   type=gha,scope=cyguard,mode=max
+
+      - name: Render + commit Formula/cyguard.rb
+        run: |
+          VERSION="${{ steps.ver.outputs.tag }}"
+          BASE="https://github.com/cybrium-ai/cyguard/releases/download/v${VERSION}"
+          mkdir -p homebrew-cli/Formula
+          cat > homebrew-cli/Formula/cyguard.rb <<RUBY
+          class Cyweb < Formula
+            desc     "Cybrium Web — fast web vulnerability scanner"
+            homepage "https://github.com/cybrium-ai/cyguard"
+            license  "Apache-2.0"
+            version  "${VERSION}"
+
+            on_macos do
+              on_arm do
+                url    "${BASE}/cyguard-darwin-arm64"
+                sha256 "${{ steps.sums.outputs.darwin_arm64_sha }}"
+              end
+              on_intel do
+                url    "${BASE}/cyguard-darwin-amd64"
+                sha256 "${{ steps.sums.outputs.darwin_amd64_sha }}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url    "${BASE}/cyguard-linux-arm64"
+                sha256 "${{ steps.sums.outputs.linux_arm64_sha }}"
+              end
+              on_intel do
+                url    "${BASE}/cyguard-linux-amd64"
+                sha256 "${{ steps.sums.outputs.linux_amd64_sha }}"
+              end
+            end
+
+            def install
+              if OS.mac? && Hardware::CPU.arm?
+                bin.install "cyguard-darwin-arm64" => "cyguard"
+              elsif OS.mac? && Hardware::CPU.intel?
+                bin.install "cyguard-darwin-amd64" => "cyguard"
+              elsif OS.linux? && Hardware::CPU.arm?
+                bin.install "cyguard-linux-arm64" => "cyguard"
+              else
+                bin.install "cyguard-linux-amd64" => "cyguard"
+              end
+            end
+
+            test do
+              assert_match "cyguard", shell_output("#{bin}/cyguard version")
+            end
+          end
+          RUBY
+          cd homebrew-cli
+          git config user.name  "cybrium-bot"
+          git config user.email "bot@cybrium.ai"
+          git add Formula/cyguard.rb
+          git commit -m "cyguard: bump to v${VERSION}" || echo "no changes"
+          git push
+
